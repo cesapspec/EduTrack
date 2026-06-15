@@ -1,0 +1,19 @@
+{% extends "base.html" %}
+
+{% block title %}Students{% endblock %}
+
+{% block content %}
+<h1>Students</h1>
+<table>
+    <tr>
+        <th>Name</th>
+        <th>Grade Level</th>
+    </tr>
+    {% for student in students %}
+    <tr>
+        <td>{{ student['first_name'] }} {{ student['last_name'] }}</td>
+        <td>{{ student['grade_level'] }}</td>
+    </tr>
+    {% endfor %}
+</table>
+{% endblock %}
