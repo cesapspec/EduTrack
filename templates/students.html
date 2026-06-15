@@ -29,8 +29,15 @@
             </option>
             {% endfor %}
         </select>
+        <select name="grade_level" onchange="this.form.submit()">
+            <option value="">All Grades</option>
+            <option value="9" {% if selected_grade == 9 %}selected{% endif %}>Grade 9</option>
+            <option value="10" {% if selected_grade == 10 %}selected{% endif %}>Grade 10</option>
+            <option value="11" {% if selected_grade == 11 %}selected{% endif %}>Grade 11</option>
+            <option value="12" {% if selected_grade == 12 %}selected{% endif %}>Grade 12</option>
+        </select>
         <a href="/add-student" class="btn btn-primary">+ Add Student</a>
-    </form>
+        </form>
 </div>
 
 <!-- Students Table -->

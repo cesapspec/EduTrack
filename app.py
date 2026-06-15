@@ -159,6 +159,7 @@ def students():
     # Get semester filter from URL
     selected_year_id = request.args.get("year_id", type=int)
     selected_semester_id = request.args.get("semester_id", type=int)
+    selected_grade = request.args.get("grade_level", type=int)
 
     # Get all years
     cursor.execute("SELECT year_id, year_name FROM academic_years ORDER BY year_name DESC")
@@ -185,7 +186,12 @@ def students():
         selected_semester_id = semesters[0]["semester_id"]
 
     # Get all students with enrollment count for selected semester
-    cursor.execute("""
+    grade_filter = "AND s.grade_level = %s" if selected_grade else ""
+    params = [selected_semester_id]
+    if selected_grade:
+        params.append(selected_grade)
+
+    cursor.execute(f"""
         SELECT 
             s.student_id,
             CONCAT(s.first_name, ' ', COALESCE(s.middle_name, ''), ' ', s.last_name) AS full_name,
@@ -195,11 +201,12 @@ def students():
         FROM students s
         LEFT JOIN enrollments e ON s.student_id = e.student_id 
             AND e.semester_id = %s
+        WHERE 1=1 {grade_filter}
         GROUP BY s.student_id
         ORDER BY s.last_name
-    """, (selected_semester_id,))
-    students = cursor.fetchall()
+    """, params)
 
+    students = cursor.fetchall()
     cursor.close()
     conn.close()
 
@@ -208,7 +215,8 @@ def students():
         years=years,
         semesters=semesters,
         selected_year_id=selected_year_id,
-        selected_semester_id=selected_semester_id
+        selected_semester_id=selected_semester_id,
+        selected_grade=selected_grade
     )
 
 
