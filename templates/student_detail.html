@@ -4,13 +4,18 @@
 
 {% block content %}
 
-<div class="page-header">
-    <a href="/students?year_id={{ selected_year_id }}&semester_id={{ selected_semester_id }}" 
-       style="font-size:13px; color:#e94560; text-decoration:none;">
-        ← Back to Students
+<div class="page-header" style="display:flex; justify-content:space-between; align-items:flex-start;">
+    <div>
+        <a href="/students?year_id={{ selected_year_id }}&semester_id={{ selected_semester_id }}" 
+           style="font-size:13px; color:#e94560; text-decoration:none;">
+            ← Back to Students
+        </a>
+        <h1 style="margin-top:8px;">{{ student['full_name'] }}</h1>
+        <p>Grade {{ student['grade_level'] }}</p>
+    </div>
+    <a href="/students/{{ student['student_id'] }}/edit" class="btn btn-primary">
+        Edit Student
     </a>
-    <h1 style="margin-top:8px;">{{ student['full_name'] }}</h1>
-    <p>Grade {{ student['grade_level'] }}</p>
 </div>
 
 <!-- Filter Bar -->

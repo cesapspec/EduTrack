@@ -371,7 +371,7 @@ def student_detail(student_id):
 
     # Get student info
     cursor.execute("""
-        SELECT first_name, middle_name, last_name, date_of_birth,
+        SELECT student_id, first_name, middle_name, last_name, date_of_birth,
                email, address, guardian_name, guardian_phone,
                grade_level, enrollment_date
         FROM students WHERE student_id = %s
@@ -1057,6 +1057,62 @@ def delete_course(course_id):
         conn.close()
     return redirect(url_for("settings", tab="courses",
         success="Course deleted successfully."))
+
+# Edit student details
+@app.route("/students/<int:student_id>/edit", methods=["GET", "POST"])
+@login_required
+def edit_student(student_id):
+    conn = get_conn()
+    cursor = conn.cursor(dictionary=True, buffered=True)
+    error = None
+
+    if request.method == "POST":
+        fname = request.form["fname"].strip()
+        mname = request.form["mname"].strip() or None
+        lname = request.form["lname"].strip()
+        date_of_birth = request.form.get("date_of_birth") or None
+        email = request.form["email"].strip()
+        address = request.form.get("address", "").strip() or None
+        guardian_name = request.form.get("guardian_name", "").strip() or None
+        guardian_phone = request.form.get("guardian_phone", "").strip() or None
+        grade_level = request.form["grade_level"]
+
+        if not all([fname, lname, email, grade_level]):
+            error = "Please fill in all required fields."
+        else:
+            try:
+                cursor.execute("""
+                    UPDATE students SET
+                        first_name = %s, middle_name = %s, last_name = %s,
+                        date_of_birth = %s, email = %s, address = %s,
+                        guardian_name = %s, guardian_phone = %s, grade_level = %s
+                    WHERE student_id = %s
+                """, (fname, mname, lname, date_of_birth, email, address,
+                      guardian_name, guardian_phone, grade_level, student_id))
+                conn.commit()
+                cursor.close()
+                conn.close()
+                return redirect(url_for("student_detail", student_id=student_id))
+            except mysql.connector.IntegrityError:
+                error = "Another student with this email already exists."
+            except mysql.connector.Error as e:
+                error = f"Database error: {str(e)}"
+
+    # GET request — load current student data into the form
+    cursor.execute("""
+        SELECT first_name, middle_name, last_name, date_of_birth,
+               email, address, guardian_name, guardian_phone, grade_level
+        FROM students WHERE student_id = %s
+    """, (student_id,))
+    student = cursor.fetchone()
+    cursor.close()
+    conn.close()
+
+    if not student:
+        return redirect(url_for("students"))
+
+    return render_template("edit_student.html", 
+        student=student, student_id=student_id, error=error)
 
 if __name__ == '__main__':
     run_daily_backup()
