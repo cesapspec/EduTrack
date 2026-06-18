@@ -38,6 +38,25 @@ def run_daily_backup():
     except subprocess.CalledProcessError as e:
         print(f"Backup failed: {e}")
 
+def cleanup_old_backups(days_to_keep=14):
+    if not os.path.exists(BACKUP_FOLDER):
+        return
+
+    now = datetime.now()
+    deleted_count = 0
+
+    for filename in os.listdir(BACKUP_FOLDER):
+        if filename.startswith("school_db_backup_") and filename.endswith(".sql"):
+            file_path = os.path.join(BACKUP_FOLDER, filename)
+            file_age_days = (now - datetime.fromtimestamp(os.path.getmtime(file_path))).days
+
+            if file_age_days > days_to_keep:
+                os.remove(file_path)
+                deleted_count += 1
+
+    if deleted_count > 0:
+        print(f"Deleted {deleted_count} backup(s) older than {days_to_keep} days.")
+
 load_dotenv()
 
 app = Flask(__name__)
@@ -1033,4 +1052,5 @@ def delete_course(course_id):
 
 if __name__ == '__main__':
     run_daily_backup()
+    cleanup_old_backups()
     app.run(debug=True)
