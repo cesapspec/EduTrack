@@ -1,0 +1,45 @@
+{% extends "base.html" %}
+{% block title %}Import Students{% endblock %}
+{% block content %}
+
+<div class="page-header">
+    <h1>Import Students</h1>
+    <p>Upload a CSV with columns: first_name, middle_name, last_name, date_of_birth, email, address, guardian_name, guardian_phone, grade_level</p>
+</div>
+
+<div class="card">
+    <form method="POST" enctype="multipart/form-data" style="display:flex; gap:10px; align-items:center;">
+        <input type="file" name="csv_file" accept=".csv" required>
+        <button type="submit" class="btn btn-primary">Upload &amp; Import</button>
+    </form>
+</div>
+
+{% if results %}
+<div class="card">
+    {% if results.error %}
+        <div class="alert alert-error">{{ results.error }}</div>
+    {% else %}
+        <div class="alert alert-success">Added {{ results.added|length }}, updated {{ results.updated|length }}, skipped {{ results.skipped|length }}.</div>
+
+        {% if results.updated %}
+        <h2>Updated</h2>
+        <ul>
+            {% for email, changes in results.updated %}
+            <li><strong>{{ email }}</strong>: {{ changes|join(', ') }}</li>
+            {% endfor %}
+        </ul>
+        {% endif %}
+
+        {% if results.skipped %}
+        <h2>Skipped</h2>
+        <ul>
+            {% for row_num, reason in results.skipped %}
+            <li>Row {{ row_num }}: {{ reason }}</li>
+            {% endfor %}
+        </ul>
+        {% endif %}
+    {% endif %}
+</div>
+{% endif %}
+
+{% endblock %}

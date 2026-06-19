@@ -7,6 +7,8 @@ import mysql.connector
 import os
 import subprocess
 from datetime import datetime
+import csv
+import io
 
 # Backup configuration
 MYSQLDUMP_PATH = r"C:\Program Files\MySQL\MySQL Server 8.0\bin\mysqldump.exe"
@@ -1175,6 +1177,91 @@ def edit_student(student_id):
 
     return render_template("edit_student.html", 
         student=student, student_id=student_id, error=error)
+
+# Import Students
+@app.route("/students/import", methods=["GET", "POST"])
+@login_required
+def import_students():
+    results = None
+    if request.method == "POST":
+        file = request.files.get("csv_file")
+        if not file or file.filename == "":
+            results = {"error": "No file selected."}
+        elif not file.filename.lower().endswith(".csv"):
+            results = {"error": "Please upload a .csv file."}
+        else:
+            stream = io.StringIO(file.stream.read().decode("utf-8-sig"))
+            reader = csv.DictReader(stream)
+
+            added, updated, skipped = [], [], []
+            conn = get_conn()
+            cursor = conn.cursor(dictionary=True, buffered=True)
+
+            for row_num, row in enumerate(reader, start=2):  # row 1 is the header
+                fname = (row.get("first_name") or "").strip()
+                mname = (row.get("middle_name") or "").strip() or None
+                lname = (row.get("last_name") or "").strip()
+                email = (row.get("email") or "").strip()
+                dob = (row.get("date_of_birth") or "").strip() or None
+                address = (row.get("address") or "").strip() or None
+                guardian_name = (row.get("guardian_name") or "").strip() or None
+                guardian_phone = (row.get("guardian_phone") or "").strip() or None
+                grade_level = (row.get("grade_level") or "").strip()
+
+                if not fname or not lname or not email or not grade_level:
+                    skipped.append((row_num, "Missing a required field (first_name, last_name, email, grade_level)"))
+                    continue
+                if "@" not in email:
+                    skipped.append((row_num, f"Invalid email: {email}"))
+                    continue
+                if grade_level not in ("9", "10", "11", "12"):
+                    skipped.append((row_num, f"Invalid grade_level: {grade_level}"))
+                    continue
+
+                try:
+                    cursor.execute("SELECT * FROM students WHERE email = %s", (email,))
+                    existing = cursor.fetchone()
+
+                    new_values = {
+                        "first_name": fname, "middle_name": mname, "last_name": lname,
+                        "date_of_birth": dob, "address": address,
+                        "guardian_name": guardian_name, "guardian_phone": guardian_phone,
+                        "grade_level": grade_level
+                    }
+
+                    if existing:
+                        changes = [
+                            f"{field}: '{existing.get(field)}' -> '{new_val}'"
+                            for field, new_val in new_values.items()
+                            if str(existing.get(field)) != str(new_val) and not (existing.get(field) is None and new_val is None)
+                        ]
+                        if changes:
+                            cursor.execute("""
+                                UPDATE students SET first_name=%s, middle_name=%s, last_name=%s,
+                                    date_of_birth=%s, address=%s, guardian_name=%s,
+                                    guardian_phone=%s, grade_level=%s
+                                WHERE email=%s
+                            """, (fname, mname, lname, dob, address, guardian_name,
+                                  guardian_phone, grade_level, email))
+                            updated.append((email, changes))
+                    else:
+                        cursor.execute("""
+                            INSERT INTO students (first_name, middle_name, last_name,
+                                date_of_birth, email, address, guardian_name, guardian_phone, grade_level)
+                            VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                        """, (fname, mname, lname, dob, email, address,
+                              guardian_name, guardian_phone, grade_level))
+                        added.append(email)
+
+                except mysql.connector.Error as e:
+                    skipped.append((row_num, f"Database error: {str(e)}"))
+
+            conn.commit()
+            cursor.close()
+            conn.close()
+            results = {"added": added, "updated": updated, "skipped": skipped}
+
+    return render_template("import_students.html", results=results)
 
 if __name__ == '__main__':
     run_daily_backup()
