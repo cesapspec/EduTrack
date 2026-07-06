@@ -1,6 +1,7 @@
-from flask import Flask, render_template, request, redirect, url_for, session, Response
+from flask import Flask, flash, render_template, request, redirect, url_for, session, Response, abort
 from flask_login import LoginManager, UserMixin, login_user, logout_user, login_required, current_user
 from werkzeug.security import generate_password_hash, check_password_hash
+from functools import wraps
 import hashlib
 from dotenv import load_dotenv
 import mysql.connector
@@ -60,6 +61,17 @@ def cleanup_old_backups(days_to_keep=14):
     if deleted_count > 0:
         print(f"Deleted {deleted_count} backup(s) older than {days_to_keep} days.")
 
+def roles_required(*allowed_roles):
+    def decorator(f):
+        @wraps(f)
+        def wrapped(*args, **kwargs):
+            if current_user.role not in allowed_roles:
+                flash("You don't have permission to access that page.", "error")
+                return redirect(url_for("dashboard"))
+            return f(*args, **kwargs)
+        return wrapped
+    return decorator
+
 load_dotenv()
 
 app = Flask(__name__)
@@ -73,10 +85,12 @@ login_manager.login_message = "Please log in to access this page."
 
 # Login manager user class
 class User(UserMixin):
-    def __init__(self, user_id, username, role):
+    def __init__(self, user_id, username, role, student_id=None, teacher_id=None):
         self.id = user_id
         self.username = username
         self.role = role
+        self.student_id = student_id
+        self.teacher_id = teacher_id
 
 @login_manager.user_loader
 def load_user(user_id):
@@ -87,7 +101,8 @@ def load_user(user_id):
     cursor.close()
     conn.close()
     if user:
-        return User(user["user_id"], user["username"], user["role"])
+        return User(user["user_id"], user["username"], user["role"],
+                    user.get("student_id"), user.get("teacher_id"))
     return None
 
 # Connect to MySQL database
@@ -120,7 +135,7 @@ def login():
             # Check password against SHA2 hash
             password_hash = hashlib.sha256(password.encode()).hexdigest()
             if password_hash == user["password_hash"]:
-                login_user(User(user["user_id"], user["username"], user["role"]))
+                login_user(User(user["user_id"], user["username"], user["role"], user.get("student_id"), user.get("teacher_id")))
                 return redirect(url_for("dashboard"))
             else:
                 error = "Incorrect password."
