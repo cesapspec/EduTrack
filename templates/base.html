@@ -310,14 +310,27 @@
     <nav>
         <a href="/" class="brand">🏫 SchoolDB</a>
         <a href="/">Dashboard</a>
+        {% if current_user.role in ['admin', 'teacher'] %}
         <a href="/students">Students</a>
+        {% endif %}
         <a href="/courses">Courses</a>
+        {% if current_user.role in ['admin', 'teacher'] %}
         <a href="/grades">Grades</a>
+        {% endif %}
+        {% if current_user.role == 'admin' %}
         <a href="/settings">Settings</a>
+        {% endif %}
         <a href="/logout" style="margin-left:auto; color:#e94560">Logout</a>
     </nav>
-
+    
     <div class="container">
+        {% with messages = get_flashed_messages(with_categories=true) %}
+            {% if messages %}
+                {% for category, message in messages %}
+                <div class="alert alert-{{ category }}">{{ message }}</div>
+                {% endfor %}
+            {% endif %}
+        {% endwith %}
         {% block content %}{% endblock %}
     </div>
 </body>

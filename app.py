@@ -1,7 +1,8 @@
-from flask import Flask, render_template, request, redirect, url_for, session, Response
+from flask import Flask, flash, render_template, request, redirect, url_for, session, Response, abort
 from flask_login import LoginManager, UserMixin, login_user, logout_user, login_required, current_user
+from flask_wtf.csrf import CSRFProtect, CSRFError
 from werkzeug.security import generate_password_hash, check_password_hash
-import hashlib
+from functools import wraps
 from dotenv import load_dotenv
 import mysql.connector
 import os
@@ -9,36 +10,119 @@ import subprocess
 from datetime import datetime
 import csv
 import io
+import getpass
+import tempfile
+import secrets
+import keyring
+from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
+from cryptography.hazmat.primitives.kdf.scrypt import Scrypt
+from cryptography.hazmat.primitives import hmac as crypto_hmac, hashes
+
+KEYRING_SERVICE = "edutrack_backup"
+KEYRING_USERNAME = "backup_encryption_key"
+
+
+def _derive_keys(passphrase: bytes, salt: bytes):
+    """Derive a 32-byte AES key and a separate 32-byte HMAC key from the
+    passphrase + salt using scrypt. Two distinct derived keys (not the same
+    bytes reused for both) so a weakness in one primitive can't cascade
+    into the other -- standard encrypt-then-MAC hygiene."""
+    kdf = Scrypt(salt=salt, length=64, n=2**14, r=8, p=1)
+    derived = kdf.derive(passphrase)
+    return derived[:32], derived[32:]
 
 # Backup configuration
 MYSQLDUMP_PATH = r"C:\Program Files\MySQL\MySQL Server 8.0\bin\mysqldump.exe"
 BACKUP_FOLDER = os.path.join(os.path.dirname(os.path.abspath(__file__)), "backups")
 
+def create_secure_option_file():
+    """
+    Writes a MySQL option file containing the DB password for mysqldump
+    to read via --defaults-extra-file, then locks its permissions down
+    via icacls so only the account running this process can read it.
+    (os.chmod is a no-op for real access control on Windows — it only
+    toggles the read-only attribute, not NTFS ACLs.)
+    Caller is responsible for deleting the returned path.
+    """
+    fd, path = tempfile.mkstemp(prefix="mysqldump_opts_", suffix=".cnf", dir=BACKUP_FOLDER)
+    try:
+        with os.fdopen(fd, "w") as f:
+            f.write("[client]\n")
+            f.write(f"password={os.getenv('DB_PASSWORD')}\n")
+
+        # /inheritance:r strips whatever permissions this file would
+        # otherwise inherit from the backups/ folder (e.g. a "Users"
+        # group with read access). /grant:r replaces the ACL entirely
+        # with just this one entry.
+        subprocess.run(
+            ["icacls", path, "/inheritance:r", "/grant:r", f"{getpass.getuser()}:F"],
+            check=True, capture_output=True
+        )
+    except Exception:
+        os.remove(path)
+        raise
+    return path
+
 def run_daily_backup():
     today_str = datetime.now().strftime("%Y-%m-%d")
-    backup_filename = f"school_db_backup_{today_str}.sql"
+    backup_filename = f"school_db_backup_{today_str}.sql.enc"
     backup_path = os.path.join(BACKUP_FOLDER, backup_filename)
 
-    # If today's backup already exists, skip
     if os.path.exists(backup_path):
         print(f"Backup already exists for today: {backup_filename}")
         return
 
-    # Make sure the backups folder exists
     os.makedirs(BACKUP_FOLDER, exist_ok=True)
 
+    passphrase = keyring.get_password(KEYRING_SERVICE, KEYRING_USERNAME)
+    if not passphrase:
+        print("ERROR: no backup passphrase in Windows Credential Manager. "
+              "Run setup_backup_encryption.py once, then retry.")
+        return
+    passphrase = passphrase.encode("utf-8")
+
+    salt = secrets.token_bytes(16)
+    nonce = secrets.token_bytes(16)  # CTR initial counter block
+    aes_key, hmac_key = _derive_keys(passphrase, salt)
+
+    encryptor = Cipher(algorithms.AES(aes_key), modes.CTR(nonce)).encryptor()
+    mac = crypto_hmac.HMAC(hmac_key, hashes.SHA256())
+
+    proc = None
     try:
-        with open(backup_path, "w") as backup_file:
-            subprocess.run([
+        with open(backup_path, "wb") as out:
+            # Header: salt + nonce. Not secret on their own -- only the
+            # passphrase is -- but needed by the restore script to
+            # re-derive the same keys.
+            out.write(salt)
+            out.write(nonce)
+
+            proc = subprocess.Popen([
                 MYSQLDUMP_PATH,
                 "--no-tablespaces",
                 "-h", os.getenv("DB_HOST"),
                 "-u", os.getenv("DB_USERNAME"),
-                f"-p{os.getenv('DB_PASSWORD')}",
+                f"-p{os.getenv('DB_PASSWORD')}",  # TODO: swap for your defaults-extra-file approach
                 os.getenv("DB_DATABASE")
-            ], stdout=backup_file, check=True)
-        print(f"Backup created successfully: {backup_filename}")
+            ], stdout=subprocess.PIPE)
+
+            for chunk in iter(lambda: proc.stdout.read(65536), b""):
+                ct_chunk = encryptor.update(chunk)
+                mac.update(ct_chunk)
+                out.write(ct_chunk)
+
+            proc.stdout.close()
+            proc.wait()
+            if proc.returncode != 0:
+                raise subprocess.CalledProcessError(proc.returncode, MYSQLDUMP_PATH)
+
+            out.write(encryptor.finalize())
+            out.write(mac.finalize())  # 32-byte tag appended at the end
+
+        print(f"Encrypted backup created successfully: {backup_filename}")
     except subprocess.CalledProcessError as e:
+        if os.path.exists(backup_path):
+            os.remove(backup_path)  # don't leave a partial/corrupt backup behind
         print(f"Backup failed: {e}")
 
 def cleanup_old_backups(days_to_keep=14):
@@ -49,7 +133,7 @@ def cleanup_old_backups(days_to_keep=14):
     deleted_count = 0
 
     for filename in os.listdir(BACKUP_FOLDER):
-        if filename.startswith("school_db_backup_") and filename.endswith(".sql"):
+        if filename.startswith("school_db_backup_") and filename.endswith(".sql.enc"):
             file_path = os.path.join(BACKUP_FOLDER, filename)
             file_age_days = (now - datetime.fromtimestamp(os.path.getmtime(file_path))).days
 
@@ -60,10 +144,28 @@ def cleanup_old_backups(days_to_keep=14):
     if deleted_count > 0:
         print(f"Deleted {deleted_count} backup(s) older than {days_to_keep} days.")
 
+def roles_required(*allowed_roles):
+    def decorator(f):
+        @wraps(f)
+        def wrapped(*args, **kwargs):
+            if current_user.role not in allowed_roles:
+                flash("You don't have permission to access that page.", "error")
+                return redirect(url_for("dashboard"))
+            return f(*args, **kwargs)
+        return wrapped
+    return decorator
+
 load_dotenv()
 
 app = Flask(__name__)
 app.secret_key = os.getenv("SECRET_KEY")
+
+csrf = CSRFProtect(app)
+
+@app.errorhandler(CSRFError)
+def handle_csrf_error(e):
+    flash("Your session expired or the form was resubmitted invalidly. Please try again.", "error")
+    return redirect(request.referrer or url_for("dashboard"))
 
 # Initialize Flask-Login
 login_manager = LoginManager()
@@ -73,10 +175,13 @@ login_manager.login_message = "Please log in to access this page."
 
 # Login manager user class
 class User(UserMixin):
-    def __init__(self, user_id, username, role):
+    def __init__(self, user_id, username, role, student_id=None, teacher_id=None, must_change_password=False):
         self.id = user_id
         self.username = username
         self.role = role
+        self.student_id = student_id
+        self.teacher_id = teacher_id
+        self.must_change_password = bool(must_change_password)
 
 @login_manager.user_loader
 def load_user(user_id):
@@ -87,7 +192,9 @@ def load_user(user_id):
     cursor.close()
     conn.close()
     if user:
-        return User(user["user_id"], user["username"], user["role"])
+        return User(user["user_id"], user["username"], user["role"],
+                    user.get("student_id"), user.get("teacher_id"),
+                    user.get("must_change_password", 0))
     return None
 
 # Connect to MySQL database
@@ -99,6 +206,19 @@ def get_conn():
         database=os.getenv('DB_DATABASE'),
         auth_plugin='mysql_native_password'
     )
+
+# Any authenticated user with a pending forced password reset gets redirected
+# to /account/password no matter what URL they request, until they set a new
+# password. This has to run globally (not just as a per-route check) or a
+# flagged user could simply avoid the routes that check for it.
+PASSWORD_CHANGE_EXEMPT_ENDPOINTS = {"account_password", "logout", "static"}
+
+@app.before_request
+def enforce_password_change():
+    if current_user.is_authenticated and getattr(current_user, "must_change_password", False):
+        if request.endpoint not in PASSWORD_CHANGE_EXEMPT_ENDPOINTS:
+            flash("You must change your password before continuing.", "info")
+            return redirect(url_for("account_password"))
 
 # Routes
 # Login and Logout
@@ -117,10 +237,13 @@ def login():
         conn.close()
 
         if user:
-            # Check password against SHA2 hash
-            password_hash = hashlib.sha256(password.encode()).hexdigest()
-            if password_hash == user["password_hash"]:
-                login_user(User(user["user_id"], user["username"], user["role"]))
+            if check_password_hash(user["password_hash"], password):
+                login_user(User(user["user_id"], user["username"], user["role"],
+                                 user.get("student_id"), user.get("teacher_id"),
+                                 user.get("must_change_password", 0)))
+                if current_user.must_change_password:
+                    flash("You must set a new password before continuing.", "info")
+                    return redirect(url_for("account_password"))
                 return redirect(url_for("dashboard"))
             else:
                 error = "Incorrect password."
@@ -135,6 +258,54 @@ def login():
 def logout():
     logout_user()
     return redirect(url_for("login"))
+
+
+# Change / set password for the currently logged-in user, regardless of role.
+# Used both for the forced-reset flow (must_change_password=1) and for anyone
+# who just wants to change their own password without going through Settings
+# (which is admin-only).
+@app.route("/account/password", methods=["GET", "POST"])
+@login_required
+def account_password():
+    error = None
+    success = None
+
+    if request.method == "POST":
+        current_password = request.form.get("current_password", "").strip()
+        new_password = request.form.get("new_password", "").strip()
+        confirm_password = request.form.get("confirm_password", "").strip()
+
+        conn = get_conn()
+        cursor = conn.cursor(dictionary=True, buffered=True)
+        cursor.execute("SELECT password_hash FROM users WHERE user_id = %s", (current_user.id,))
+        user = cursor.fetchone()
+
+        if not user or not check_password_hash(user["password_hash"], current_password):
+            error = "Current password is incorrect."
+        elif new_password != confirm_password:
+            error = "New passwords do not match."
+        elif len(new_password) < 6:
+            error = "New password must be at least 6 characters."
+        else:
+            new_hash = generate_password_hash(new_password)
+            cursor.execute(
+                "UPDATE users SET password_hash = %s, must_change_password = 0 WHERE user_id = %s",
+                (new_hash, current_user.id)
+            )
+            conn.commit()
+            cursor.close()
+            conn.close()
+            current_user.must_change_password = False
+            flash("Password changed successfully.", "success")
+            return redirect(url_for("dashboard"))
+
+        cursor.close()
+        conn.close()
+
+    return render_template("change_password.html",
+        error=error, success=success,
+        forced=current_user.must_change_password)
+
 
 # Dashboard
 @app.route("/")
@@ -175,7 +346,31 @@ def dashboard():
     if not selected_semester_id and semesters:
         selected_semester_id = semesters[0]["semester_id"]
 
-    # Dashboard metrics
+    if current_user.role == 'student':
+            my_grades = []
+            gpa = None
+            if selected_semester_id:
+                cursor.execute("""
+                    SELECT c.course_name, e.final_grade
+                    FROM enrollments e
+                    JOIN courses c ON e.course_id = c.course_id
+                    WHERE e.student_id = %s AND e.semester_id = %s
+                """, (current_user.student_id, selected_semester_id))
+                my_grades = cursor.fetchall()
+
+                grade_points = {'S': 4.0, 'A': 3.5, 'B': 3.0, 'C': 2.0, 'D': 1.0, 'F': 0.0}
+                points = [grade_points[g['final_grade']] for g in my_grades if g['final_grade'] in grade_points]
+                if points:
+                    gpa = round(sum(points) / len(points), 2)
+
+            cursor.close()
+            conn.close()
+            return render_template("student_dashboard.html",
+                years=years, semesters=semesters,
+                selected_year_id=selected_year_id, selected_semester_id=selected_semester_id,
+                my_grades=my_grades, gpa=gpa)
+
+    # Admin & teacher: existing school-wide metrics
     metrics = {"students": 0, "courses": 0, "enrollments": 0}
     top_students = []
     grade_distribution = []
@@ -283,6 +478,7 @@ STUDENTS_PER_PAGE = 20
 
 @app.route("/students")
 @login_required
+@roles_required("admin", "teacher")
 def students():
     conn = get_conn()
     cursor = conn.cursor(dictionary=True)
@@ -332,6 +528,17 @@ def students():
     # and matching parameter, in the same order, to keep them in sync.
     where_clauses = ["1=1"]
     where_params = []
+
+    # Data-level scoping: a teacher only ever sees students in courses they teach
+    if current_user.role == 'teacher':
+        where_clauses.append("""
+            s.student_id IN (
+                SELECT e2.student_id FROM enrollments e2
+                JOIN courses c2 ON e2.course_id = c2.course_id
+                WHERE c2.teacher_id = %s
+            )
+        """)
+        where_params.append(current_user.teacher_id)
 
     if selected_grade:
         where_clauses.append("s.grade_level = %s")
@@ -408,6 +615,27 @@ def students():
 def student_detail(student_id):
     conn = get_conn()
     cursor = conn.cursor(dictionary=True)
+
+    # Data-level authorization: build the WHERE clause based on WHO is asking,
+    # not just whether they're logged in.
+    if current_user.role == 'admin':
+        pass  # no extra restriction
+    elif current_user.role == 'teacher':
+        cursor.execute("""
+            SELECT 1 FROM enrollments e
+            WHERE e.student_id = %s
+            AND e.course_id IN (SELECT course_id FROM courses WHERE teacher_id = %s)
+            LIMIT 1
+        """, (student_id, current_user.teacher_id))
+        if not cursor.fetchone():
+            flash("You don't have access to that student's record.", "error")
+            return redirect(url_for('dashboard'))
+    elif current_user.role == 'student':
+        if student_id != current_user.student_id:
+            flash("You don't have access to that student's record.", "error")
+            return redirect(url_for('dashboard'))
+
+    # ... rest of the existing route logic continues unchanged below
 
     selected_year_id = request.args.get("year_id", type=int)
     selected_semester_id = request.args.get("semester_id", type=int)
@@ -494,6 +722,7 @@ def student_detail(student_id):
 # Add Student
 @app.route("/add-student", methods=["GET", "POST"])
 @login_required
+@roles_required("admin")
 def add_student():
     error = None
     success = None
@@ -538,6 +767,7 @@ def add_student():
 # Grades
 @app.route("/grades", methods=["GET", "POST"])
 @login_required
+@roles_required("admin", "teacher") #students can view their own grades on the dashboard, so no need to allow them here
 def grades():
     conn = get_conn()
     cursor = conn.cursor(dictionary=True, buffered=True)
@@ -579,8 +809,11 @@ def grades():
 
         # Enroll student
         if action == "enroll":
-            student_id = request.form.get("student_id")
-            course_id = request.form.get("course_id")
+            if current_user.role != 'admin':
+                error = "Only admins can enroll students."
+            else:
+                student_id = request.form.get("student_id")
+                course_id = request.form.get("course_id")
 
             if not all([student_id, course_id, selected_semester_id]):
                 error = "Please select a student, course, and semester."
@@ -606,48 +839,51 @@ def grades():
             if not all([enrollment_id, new_grade]):
                 error = "Please select an enrollment and a grade."
             else:
-                try:
+            # Ownership check: a teacher can only grade enrollments in courses THEY teach
+                if current_user.role == 'teacher':
                     cursor.execute("""
-                        UPDATE enrollments 
-                        SET final_grade = %s 
-                        WHERE enrollment_id = %s
-                    """, (new_grade, enrollment_id))
+                        SELECT 1 FROM enrollments e
+                        JOIN courses c ON e.course_id = c.course_id
+                        WHERE e.enrollment_id = %s AND c.teacher_id = %s
+                    """, (enrollment_id, current_user.teacher_id))
+                    if not cursor.fetchone():
+                        error = "You can't update grades for a course you don't teach."
+
+                if not error:
+                    cursor.execute("UPDATE enrollments SET final_grade = %s WHERE enrollment_id = %s",
+                                   (new_grade, enrollment_id))
                     conn.commit()
                     success = f"Grade updated to {new_grade} successfully."
-                except mysql.connector.Error as e:
-                    error = f"Database error: {str(e)}"
 
-    # Get all enrollments for selected semester
+    # Enrollments list — scoped for teachers to only their own courses' enrollments
     enrollments = []
     if selected_semester_id:
-        cursor.execute("""
-            SELECT 
-                e.enrollment_id,
-                CONCAT(s.first_name, ' ', COALESCE(s.middle_name, ''), ' ', s.last_name) AS student_name,
-                s.grade_level,
-                c.course_name,
-                DATE(e.enrollment_date) AS enrollment_date,
-                COALESCE(e.final_grade, 'Not graded') AS final_grade
+        where = "e.semester_id = %s"
+        params = [selected_semester_id]
+        if current_user.role == 'teacher':
+            where += " AND c.teacher_id = %s"
+            params.append(current_user.teacher_id)
+
+        cursor.execute(f"""
+            SELECT e.enrollment_id,
+                   CONCAT(s.first_name, ' ', COALESCE(s.middle_name, ''), ' ', s.last_name) AS student_name,
+                   s.grade_level, c.course_name, DATE(e.enrollment_date) AS enrollment_date,
+                   COALESCE(e.final_grade, 'Not graded') AS final_grade
             FROM enrollments e
             JOIN students s ON e.student_id = s.student_id
             JOIN courses c ON e.course_id = c.course_id
-            WHERE e.semester_id = %s
+            WHERE {where}
             ORDER BY s.last_name, c.course_name
-        """, (selected_semester_id,))
+        """, params)
         enrollments = cursor.fetchall()
 
-    # Get all students for enroll dropdown
-    cursor.execute("""
-        SELECT student_id, 
-               CONCAT(first_name, ' ', last_name) AS full_name 
-        FROM students 
-        ORDER BY last_name
-    """)
-    all_students = cursor.fetchall()
-
-    # Get all courses for enroll dropdown
-    cursor.execute("SELECT course_id, course_name FROM courses ORDER BY course_name")
-    all_courses = cursor.fetchall()
+    # Dropdown data — only admins need the full lists (enroll form is admin-only)
+    all_students, all_courses = [], []
+    if current_user.role == 'admin':
+        cursor.execute("SELECT student_id, CONCAT(first_name, ' ', last_name) AS full_name FROM students ORDER BY last_name")
+        all_students = cursor.fetchall()
+        cursor.execute("SELECT course_id, course_name FROM courses ORDER BY course_name")
+        all_courses = cursor.fetchall()
 
     cursor.close()
     conn.close()
@@ -732,6 +968,19 @@ def courses():
 def course_detail(course_id):
     conn = get_conn()
     cursor = conn.cursor(dictionary=True, buffered=True)
+
+    if current_user.role == 'teacher':
+        cursor.execute("SELECT 1 FROM courses WHERE course_id = %s AND teacher_id = %s",
+                       (course_id, current_user.teacher_id))
+        if not cursor.fetchone():
+            flash("You don't have access to that course.", "error")
+            return redirect(url_for('dashboard'))
+    elif current_user.role == 'student':
+        cursor.execute("SELECT 1 FROM enrollments WHERE course_id = %s AND student_id = %s LIMIT 1",
+                       (course_id, current_user.student_id))
+        if not cursor.fetchone():
+            flash("You don't have access to that course.", "error")
+            return redirect(url_for('dashboard'))
 
     selected_year_id = request.args.get("year_id", type=int)
     selected_semester_id = request.args.get("semester_id", type=int)
@@ -826,6 +1075,7 @@ def course_detail(course_id):
 #Settings
 @app.route("/settings", methods=["GET", "POST"])
 @login_required
+@roles_required("admin")
 def settings():
     conn = get_conn()
     cursor = conn.cursor(dictionary=True, buffered=True)
@@ -935,14 +1185,13 @@ def settings():
         new_password = request.form.get("new_password", "").strip()
         confirm_password = request.form.get("confirm_password", "").strip()
 
-        current_hash = hashlib.sha256(current_password.encode()).hexdigest()
         cursor.execute(
             "SELECT password_hash FROM users WHERE user_id = %s",
             (current_user.id,)
         )
         user = cursor.fetchone()
 
-        if not user or current_hash != user["password_hash"]:
+        if not user or not check_password_hash(user["password_hash"], current_password):
             error = "Current password is incorrect."
             active_tab = "account"
         elif new_password != confirm_password:
@@ -952,9 +1201,9 @@ def settings():
             error = "New password must be at least 6 characters."
             active_tab = "account"
         else:
-            new_hash = hashlib.sha256(new_password.encode()).hexdigest()
+            new_hash = generate_password_hash(new_password)
             cursor.execute(
-                "UPDATE users SET password_hash = %s WHERE user_id = %s",
+                "UPDATE users SET password_hash = %s, must_change_password = 0 WHERE user_id = %s",
                 (new_hash, current_user.id)
             )
             conn.commit()
@@ -1005,6 +1254,7 @@ def settings():
 # Delete routes
 @app.route("/settings/delete/year/<int:year_id>", methods=["POST"])
 @login_required
+@roles_required("admin")
 def delete_year(year_id):
     conn = get_conn()
     cursor = conn.cursor(dictionary=True, buffered=True)
@@ -1041,6 +1291,7 @@ def delete_year(year_id):
 
 @app.route("/settings/delete/semester/<int:semester_id>", methods=["POST"])
 @login_required
+@roles_required("admin")
 def delete_semester(semester_id):
     conn = get_conn()
     cursor = conn.cursor(dictionary=True, buffered=True)
@@ -1069,6 +1320,7 @@ def delete_semester(semester_id):
 
 @app.route("/settings/delete/teacher/<int:teacher_id>", methods=["POST"])
 @login_required
+@roles_required("admin")
 def delete_teacher(teacher_id):
     conn = get_conn()
     cursor = conn.cursor(dictionary=True, buffered=True)
@@ -1097,6 +1349,7 @@ def delete_teacher(teacher_id):
 
 @app.route("/settings/delete/course/<int:course_id>", methods=["POST"])
 @login_required
+@roles_required("admin")
 def delete_course(course_id):
     conn = get_conn()
     cursor = conn.cursor(dictionary=True, buffered=True)
@@ -1125,6 +1378,7 @@ def delete_course(course_id):
 # Edit student details
 @app.route("/students/<int:student_id>/edit", methods=["GET", "POST"])
 @login_required
+@roles_required("admin")
 def edit_student(student_id):
     conn = get_conn()
     cursor = conn.cursor(dictionary=True, buffered=True)
@@ -1181,6 +1435,7 @@ def edit_student(student_id):
 # Import Students
 @app.route("/students/import", methods=["GET", "POST"])
 @login_required
+@roles_required("admin")
 def import_students():
     results = None
     if request.method == "POST":
@@ -1266,6 +1521,7 @@ def import_students():
 # Export Template
 @app.route("/students/import/template")
 @login_required
+@roles_required("admin")
 def student_import_template():
     output = io.StringIO()
     writer = csv.writer(output)

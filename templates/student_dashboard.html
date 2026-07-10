@@ -1,0 +1,47 @@
+{% extends "base.html" %}
+{% block title %}My Dashboard{% endblock %}
+{% block content %}
+<div class="page-header">
+    <h1>My Dashboard</h1>
+    <p>Your grades this semester</p>
+</div>
+
+<div class="filter-bar">
+    <form method="GET" style="display:flex; gap:10px; align-items:center;">
+        <select name="year_id" onchange="this.form.submit()">
+            {% for year in years %}
+            <option value="{{ year['year_id'] }}" {% if year['year_id'] == selected_year_id %}selected{% endif %}>{{ year['year_name'] }}</option>
+            {% endfor %}
+        </select>
+        <select name="semester_id" onchange="this.form.submit()">
+            {% for semester in semesters %}
+            <option value="{{ semester['semester_id'] }}" {% if semester['semester_id'] == selected_semester_id %}selected{% endif %}>{{ semester['semester_name'] }}</option>
+            {% endfor %}
+        </select>
+    </form>
+</div>
+
+<div class="metrics-grid" style="grid-template-columns:1fr;">
+    <div class="metric-card red">
+        <h3>My GPA</h3>
+        <div class="value">{{ gpa if gpa is not none else 'N/A' }}</div>
+    </div>
+</div>
+
+<div class="card">
+    <h2>My Grades</h2>
+    {% if my_grades %}
+    <table>
+        <thead><tr><th>Course</th><th>Grade</th></tr></thead>
+        <tbody>
+            {% for g in my_grades %}
+            <tr><td>{{ g['course_name'] }}</td>
+                <td>{% if g['final_grade'] %}<span class="grade-badge">{{ g['final_grade'] }}</span>{% else %}<span style="color:#bbb;">Not graded</span>{% endif %}</td></tr>
+            {% endfor %}
+        </tbody>
+    </table>
+    {% else %}
+    <div class="empty-state">No courses recorded this semester.</div>
+    {% endif %}
+</div>
+{% endblock %}

@@ -1,5 +1,7 @@
 .env
 SQL Scheme.sql
 .gitignore
+!database/schema.sql
 
+requirements.txt
 backups/
