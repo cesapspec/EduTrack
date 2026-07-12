@@ -1,13 +1,15 @@
 from flask import Flask, flash, render_template, request, redirect, url_for, session, Response, abort
 from flask_login import LoginManager, UserMixin, login_user, logout_user, login_required, current_user
 from flask_wtf.csrf import CSRFProtect, CSRFError
+from flask_limiter import Limiter
+from flask_limiter.util import get_remote_address
 from werkzeug.security import generate_password_hash, check_password_hash
 from functools import wraps
 from dotenv import load_dotenv
 import mysql.connector
 import os
 import subprocess
-from datetime import datetime
+from datetime import datetime, timedelta
 import csv
 import io
 import getpass
@@ -157,6 +159,15 @@ def roles_required(*allowed_roles):
         return wrapped
     return decorator
 
+# Rate limiting helper: exponential backoff for repeated failures
+def backoff_seconds(failed_attempts):
+    """Exponential delay after repeated failures, capped at 5 minutes.
+    No delay for the first couple of failures — normal typos shouldn't
+    be punished, only sustained guessing."""
+    if failed_attempts < 3:
+        return 0
+    return min(300, 2 ** (failed_attempts - 2))  # 2s, 4s, 8s ... capped
+
 # Correlation ref logging for database errors. This is a security measure to avoid exposing raw DB errors to users, while still allowing developers to trace issues.
 def log_db_error(exc):
     """Log the real exception server-side under a short correlation ref,
@@ -181,6 +192,13 @@ if not app.debug:
     app.logger.setLevel(logging.INFO)
 
 csrf = CSRFProtect(app)
+
+# Rate limiting to prevent brute-force attacks on login and other sensitive endpoints
+limiter = Limiter(
+    get_remote_address,
+    app=app,
+    storage_uri="memory://",  # fine for single-process; revisit if you ever run multiple workers
+)
 
 @app.errorhandler(CSRFError)
 def handle_csrf_error(e):
@@ -243,6 +261,7 @@ def enforce_password_change():
 # Routes
 # Login and Logout
 @app.route("/login", methods=["GET", "POST"])
+@limiter.limit("10 per minute", key_func=get_remote_address, error_message="Too many login attempts. Please try again later.")
 def login():
     error = None
     if request.method == "POST":
@@ -253,22 +272,39 @@ def login():
         cursor = conn.cursor(dictionary=True, buffered=True)
         cursor.execute("SELECT * FROM users WHERE username = %s", (username,))
         user = cursor.fetchone()
+
+        if user and user["locked_until"] and user["locked_until"] > datetime.now():
+            wait = int((user["locked_until"] - datetime.now()).total_seconds())
+            error = f"Too many failed attempts. Try again in {wait} second(s)."
+        elif user and check_password_hash(user["password_hash"], password):
+            cursor.execute(
+                "UPDATE users SET failed_login_attempts = 0, locked_until = NULL WHERE user_id = %s",
+                (user["user_id"],)
+            )
+            conn.commit()
+            cursor.close()
+            conn.close()
+            login_user(User(user["user_id"], user["username"], user["role"],
+                             user.get("student_id"), user.get("teacher_id"),
+                             user.get("must_change_password", 0)))
+            if current_user.must_change_password:
+                flash("You must set a new password before continuing.", "info")
+                return redirect(url_for("account_password"))
+            return redirect(url_for("dashboard"))
+        else:
+            if user:
+                attempts = user["failed_login_attempts"] + 1
+                delay = backoff_seconds(attempts)
+                new_locked_until = datetime.now() + timedelta(seconds=delay) if delay else None
+                cursor.execute(
+                    "UPDATE users SET failed_login_attempts = %s, locked_until = %s WHERE user_id = %s",
+                    (attempts, new_locked_until, user["user_id"])
+                )
+                conn.commit()
+            error = "Incorrect username or password."
+
         cursor.close()
         conn.close()
-
-        if user:
-            if check_password_hash(user["password_hash"], password):
-                login_user(User(user["user_id"], user["username"], user["role"],
-                                 user.get("student_id"), user.get("teacher_id"),
-                                 user.get("must_change_password", 0)))
-                if current_user.must_change_password:
-                    flash("You must set a new password before continuing.", "info")
-                    return redirect(url_for("account_password"))
-                return redirect(url_for("dashboard"))
-            else:
-                error = "Incorrect password."
-        else:
-            error = "Username not found."
 
     return render_template("login.html", error=error)
 
