@@ -14,6 +14,8 @@ import getpass
 import tempfile
 import secrets
 import keyring
+import logging
+from logging.handlers import RotatingFileHandler
 from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
 from cryptography.hazmat.primitives.kdf.scrypt import Scrypt
 from cryptography.hazmat.primitives import hmac as crypto_hmac, hashes
@@ -155,10 +157,28 @@ def roles_required(*allowed_roles):
         return wrapped
     return decorator
 
+# Correlation ref logging for database errors. This is a security measure to avoid exposing raw DB errors to users, while still allowing developers to trace issues.
+def log_db_error(exc):
+    """Log the real exception server-side under a short correlation ref,
+    and return that ref so the caller can show it to the user instead of
+    the raw exception text."""
+    ref = secrets.token_hex(4)
+    app.logger.error("DB error [ref=%s]: %s", ref, exc, exc_info=True)
+    return ref
+
 load_dotenv()
 
 app = Flask(__name__)
 app.secret_key = os.getenv("SECRET_KEY")
+
+# Set up logging to a file with rotation, only in production (not debug mode)
+if not app.debug:
+    os.makedirs("logs", exist_ok=True)
+    file_handler = RotatingFileHandler("logs/app.log", maxBytes=1_000_000, backupCount=5)
+    file_handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s: %(message)s"))
+    file_handler.setLevel(logging.INFO)
+    app.logger.addHandler(file_handler)
+    app.logger.setLevel(logging.INFO)
 
 csrf = CSRFProtect(app)
 
@@ -757,7 +777,8 @@ def add_student():
             except mysql.connector.IntegrityError:
                 error = "A student with this email already exists."
             except mysql.connector.Error as e:
-                error = f"Database error: {str(e)}"
+                ref = log_db_error(e)
+                error = f"Something went wrong on our end (ref: {ref}). Please try again or contact an admin."
             finally:
                 cursor.close()
                 conn.close()
@@ -829,7 +850,8 @@ def grades():
                 except mysql.connector.IntegrityError:
                     error = "This student is already enrolled in that course."
                 except mysql.connector.Error as e:
-                    error = f"Database error: {str(e)}"
+                    ref = log_db_error(e)
+                    error = f"Something went wrong on our end (ref: {ref}). Please try again or contact an admin."
 
         # Update grade
         elif action == "update_grade":
@@ -1280,8 +1302,9 @@ def delete_year(year_id):
         cursor.execute("DELETE FROM academic_years WHERE year_id = %s", (year_id,))
         conn.commit()
     except mysql.connector.Error as e:
+        ref = log_db_error(e)
         return redirect(url_for("settings", tab="academic",
-            error=f"Database error: {str(e)}"))
+            error=f"Something went wrong on our end (ref: {ref}). Please try again or contact an admin."))
     finally:
         cursor.close()
         conn.close()
@@ -1309,8 +1332,9 @@ def delete_semester(semester_id):
         cursor.execute("DELETE FROM semesters WHERE semester_id = %s", (semester_id,))
         conn.commit()
     except mysql.connector.Error as e:
+        ref = log_db_error(e)
         return redirect(url_for("settings", tab="academic",
-            error=f"Database error: {str(e)}"))
+            error=f"Something went wrong on our end (ref: {ref}). Please try again or contact an admin."))
     finally:
         cursor.close()
         conn.close()
@@ -1338,8 +1362,9 @@ def delete_teacher(teacher_id):
         cursor.execute("DELETE FROM teachers WHERE teacher_id = %s", (teacher_id,))
         conn.commit()
     except mysql.connector.Error as e:
+        ref = log_db_error(e)
         return redirect(url_for("settings", tab="teachers",
-            error=f"Database error: {str(e)}"))
+            error=f"Something went wrong on our end (ref: {ref}). Please try again or contact an admin."))
     finally:
         cursor.close()
         conn.close()
@@ -1367,8 +1392,9 @@ def delete_course(course_id):
         cursor.execute("DELETE FROM courses WHERE course_id = %s", (course_id,))
         conn.commit()
     except mysql.connector.Error as e:
+        ref = log_db_error(e)
         return redirect(url_for("settings", tab="courses",
-            error=f"Database error: {str(e)}"))
+            error=f"Something went wrong on our end (ref: {ref}). Please try again or contact an admin."))
     finally:
         cursor.close()
         conn.close()
@@ -1414,7 +1440,8 @@ def edit_student(student_id):
             except mysql.connector.IntegrityError:
                 error = "Another student with this email already exists."
             except mysql.connector.Error as e:
-                error = f"Database error: {str(e)}"
+                ref = log_db_error(e)
+                error = f"Something went wrong on our end (ref: {ref}). Please try again or contact an admin."
 
     # GET request — load current student data into the form
     cursor.execute("""
@@ -1509,7 +1536,8 @@ def import_students():
                         added.append(email)
 
                 except mysql.connector.Error as e:
-                    skipped.append((row_num, f"Database error: {str(e)}"))
+                    ref = log_db_error(e)
+                    skipped.append((row_num, f"Internal error (ref: {ref}) — this row was skipped."))
 
             conn.commit()
             cursor.close()
