@@ -181,6 +181,9 @@ load_dotenv()
 
 app = Flask(__name__)
 app.secret_key = os.getenv("SECRET_KEY")
+app.config["SESSION_COOKIE_HTTPONLY"] = True
+app.config["SESSION_COOKIE_SAMESITE"] = "Lax"
+app.config["SESSION_COOKIE_SECURE"] = not debug_mode
 
 # Set up logging to a file with rotation, only in production (not debug mode)
 if not app.debug:
@@ -1605,7 +1608,6 @@ def student_import_template():
     )
 
 if __name__ == '__main__':
-    debug_mode = os.getenv("FLASK_DEBUG", "false").lower() == "true"
     run_daily_backup()
     cleanup_old_backups()
     app.run(debug=debug_mode)
